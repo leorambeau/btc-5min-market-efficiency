@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Is a 5-minute prediction market efficient? A machine-learning test on Polymarket's Bitcoin Up/Down</title>
+<meta name="description" content="A research write-up: building a machine-learning model for Polymarket's 5-minute Bitcoin Up/Down markets, testing it against the market's own prices, and what survived once costs and statistics were applied.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js" charset="utf-8"></script>
+</head>
+<body>
+
+<aside class="toc" aria-label="Contents">
+  <p class="toc-title">Contents</p>
+  <ol>
+    <li><a href="#abstract">Abstract</a></li>
+    <li><a href="#market">The market</a></li>
+    <li><a href="#hypothesis">Hypothesis</a></li>
+    <li><a href="#data">Data</a></li>
+    <li><a href="#model">Model</a></li>
+    <li><a href="#simulation">Live simulation</a></li>
+    <li><a href="#evaluation">Testing</a></li>
+    <li><a href="#results">Results</a></li>
+    <li><a href="#limits">Limitations</a></li>
+    <li><a href="#learned">What I learned</a></li>
+    <li><a href="#appendix">Appendix</a></li>
+  </ol>
+</aside>
+
+<main>
+
+<header class="title" id="top">
+  <p class="label">Research note · Machine learning · Market microstructure</p>
+  <h1>Is a five-minute prediction market efficient?</h1>
+  <p class="subtitle">Building a model for Polymarket's Bitcoin Up/Down contracts, testing it against the market's own prices, and measuring what survives once costs and statistics are applied.</p>
+</header>
+
+<section id="abstract">
+  <h2><span class="num">0</span>Abstract</h2>
+  <div class="abstract">
+    <p>In February 2026 Polymarket began listing a new contract: will Bitcoin close a five-minute window above its opening price? A young market with few participants and thin liquidity is a natural candidate for mispricing. I built an end-to-end system to test that idea: a stacked ensemble (gradient boosting and an LSTM) fed by live Binance data, a fractional-Kelly betting engine, and a simulator running against Polymarket's real order book.</p>
+    <p>The model is genuinely predictive (out-of-sample AUC 0.823). Early simulation looked profitable: +32.6% return on stake. After replaying every bet under realistic execution (paying the ask, paying the taker fee, one bet per independent window, executable odds only) the return fell to +22.6%, with a 95% confidence interval of [−1.9%, +46.7%] over 156 windows. Against the market's own probabilities the model's advantage is not statistically significant. <strong>The data do not reject market efficiency.</strong></p>
+  </div>
+  <dl class="keyfacts">
+    <div><dt>0.823</dt><dd>out-of-sample AUC</dd></div>
+    <div><dt>156</dt><dd>independent windows tested</dd></div>
+    <div><dt>+22.6%</dt><dd>corrected return, point estimate</dd></div>
+    <div><dt>[−1.9, +46.7]%</dt><dd>95% CI, includes zero</dd></div>
+  </dl>
+</section>
+
+<section id="market">
+  <h2><span class="num">1</span>The market</h2>
+  <p>Polymarket is a prediction market: each contract pays $1 if an event occurs and $0 otherwise, so its price in dollars reads directly as a probability. In mid-February 2026 it launched a high-frequency series, <em>Bitcoin Up or Down</em>, with a fresh contract every five minutes.<sup><a href="#fn1" id="r1">1</a></sup> Each window resolves "Up" if Bitcoin's price at the end is at or above its price at the start, and "Down" otherwise.</p>
+  <p>Three properties make it an unusual object of study:</p>
+  <ul>
+    <li><strong>Short horizon.</strong> A new, independent contract every 300 seconds produces thousands of resolved observations per week, far faster than daily or monthly markets.</li>
+    <li><strong>Observable ground truth.</strong> The underlying price is public and streams in real time, so any information the model uses is also available to every participant.</li>
+    <li><strong>A new market.</strong> At launch there were few participants, little depth in the order book and, plausibly, few systematic models. That is the setting in which prices tend to lag information.</li>
+  </ul>
+
+  <figure>
+    <div class="rail" id="fig-rail"></div>
+    <figcaption><strong>Figure 1.</strong> Timeline of the study. Launch date from press coverage<sup><a href="#fn1">1</a></sup>; the other dates are those of the data, test window and simulation sessions in this project.</figcaption>
+  </figure>
+</section>
+
+<section id="hypothesis">
+  <h2><span class="num">2</span>Hypothesis</h2>
+  <p>The opportunity, as I saw it at the outset, was that the market was <em>incomplete</em>: its price might not yet reflect everything knowable from the live Bitcoin feed in the first seconds of a window. This can be stated as a testable pair.</p>
+  <div class="boxed">
+    <p><strong>H<sub>0</sub> (efficiency).</strong> The market price is an unbiased estimate of P(Up). No model built from public data beats it by more than noise, after costs.</p>
+    <p><strong>H<sub>1</sub> (incompleteness).</strong> A model using live microstructure features assigns more accurate probabilities than the market, and the difference survives spread and fees.</p>
+  </div>
+  <p>Two distinct questions are hidden in H<sub>1</sub>, and keeping them apart is the point of this note. First, <em>is the model accurate?</em> Second, <em>is it more accurate than the price?</em> A model can answer yes to the first and no to the second.</p>
+</section>
+
+<section id="data">
+  <h2><span class="num">3</span>Data</h2>
+  <p>The system listens to four live streams and aligns them on a one-second grid inside each five-minute window.</p>
+  <table class="tbl">
+    <thead><tr><th>Source</th><th>Stream</th><th>Used for</th></tr></thead>
+    <tbody>
+      <tr><td>Binance</td><td><code>btcusdt@trade</code>, <code>btcusdc@trade</code></td><td>1-second price bars in two quote currencies</td></tr>
+      <tr><td>Binance</td><td><code>btcusdt@depth20@100ms</code></td><td>Order-book imbalance features</td></tr>
+      <tr><td>Binance</td><td><code>!forceOrder@arr</code></td><td>Liquidations as a stress signal</td></tr>
+      <tr><td>Polymarket</td><td>Gamma REST, CLOB REST + WebSocket</td><td>Market discovery; best bid / ask of both tokens</td></tr>
+    </tbody>
+  </table>
+  <p>Historical bars begin on 1 March 2026 and are stored as Parquet. From these, 57 features are built: returns and volatility over several lags, order-book imbalance, liquidation intensity, the time elapsed in the window, the distance from the opening price, and context from the previous windows.</p>
+  <details>
+    <summary>Data-quality issues encountered</summary>
+    <ul>
+      <li><strong>Mixed timestamp units.</strong> 37 bar files store microseconds while the rest store milliseconds; unnormalised, they parse as the year 58166. Whether the training pipeline silently excluded them is an open verification item.</li>
+      <li><strong>Missing seconds.</strong> About 11% of seconds contain no trade and are forward-filled.</li>
+      <li><strong>Resolution oracle.</strong> Polymarket resolves on Chainlink; the simulator resolves on Binance prices. The two can disagree near the strike, which is a persistent basis risk.</li>
+    </ul>
+  </details>
+</section>
+
+<section id="model">
+  <h2><span class="num">4</span>Model</h2>
+  <p>Predicting the end of a window is a different problem at second 10 than at second 280, so the model is segmented by elapsed time. Four gradient-boosting models cover 0–60, 60–180, 180–270 and 270–300 seconds, each calibrated with isotonic regression. An LSTM reads the last 60 five-second bars. A logistic-regression meta-model blends the two into P(Up).</p>
+
+  <figure>
+    <div class="flow">
+      <div class="fn">Streams</div><div class="fa">→</div>
+      <div class="fn">57 features</div><div class="fa">→</div>
+      <div class="fn stack"><span>4 × gradient boosting<br><small>time-segmented, calibrated</small></span><span>LSTM<br><small>60 × 5 s, 2 layers, 64 units</small></span></div><div class="fa">→</div>
+      <div class="fn">Meta logistic<br>regression</div><div class="fa">→</div>
+      <div class="fn out">P(Up)</div>
+    </div>
+    <figcaption><strong>Figure 2.</strong> Model architecture (EnsembleV2).</figcaption>
+  </figure>
+
+  <p>On a held-out test period (15–23 April 2026, 135,818 samples) the ensemble reaches 73.24% accuracy against a 51.00% baseline, with AUC 0.8227 and Brier score 0.1722. A single walk-forward fold gives 70.95% accuracy and AUC 0.798. Accuracy depends steeply on position in the window:</p>
+
+  <figure>
+    <div id="chart-accuracy" class="chart"></div>
+    <figcaption><strong>Figure 3.</strong> Test accuracy (bars) and AUC (line) by position in the window. Dotted line: 51% baseline.</figcaption>
+  </figure>
+
+  <div class="note">
+    <strong>Interpretation.</strong> Accuracy of 88% at second 270 is not 88% <em>profit</em> at second 270. By then the market price has already moved close to 0 or 1, so little is left to win. The relevant benchmark is the price, not 50%.
+  </div>
+
+  <details>
+    <summary>Training details</summary>
+    <table class="tbl small">
+      <thead><tr><th>Segment</th><th>Train / calibration</th><th>Cal. accuracy</th><th>Cal. AUC</th></tr></thead>
+      <tbody>
+        <tr><td>0–60 s</td><td>44,596 / 11,149</td><td>58.8%</td><td>0.628</td></tr>
+        <tr><td>60–180 s</td><td>97,305 / 24,327</td><td>70.6%</td><td>0.782</td></tr>
+        <tr><td>180–270 s</td><td>72,978 / 18,245</td><td>80.8%</td><td>0.895</td></tr>
+        <tr><td>270–300 s</td><td>24,321 / 6,081</td><td>89.0%</td><td>0.955</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>Gradient boosting: scikit-learn <code>HistGradientBoosting</code>, 400 iterations, isotonic calibration on a held-out split.</li>
+      <li>LSTM: PyTorch, trained on Apple GPU (MPS); standalone validation AUC 0.750. A memory failure on MPS was resolved with chunked validation and explicit cache clearing.</li>
+      <li>Ensemble validation: 71.66% accuracy, AUC 0.804. Models are versioned by date and retrained on a schedule.</li>
+    </ul>
+  </details>
+</section>
+
+<section id="simulation">
+  <h2><span class="num">5</span>Live simulation</h2>
+  <p>The betting engine compares the model's probability <em>q</em> with the price of the token it would buy. When the edge clears a threshold that relaxes through the window (12% early, 5% late), it sizes the bet with a quarter-Kelly rule capped at $3. The cost of a share includes the spread and the taker fee, which Polymarket charges at <code>0.07 × p × (1 − p)</code> per share, or 7% × (1 − p) of the stake.<sup><a href="#fn2" id="r2">2</a></sup></p>
+  <div class="eq">
+    <div><span>cost</span><code>c = ask · (1 + 0.07 · (1 − ask))</code></div>
+    <div><span>net odds</span><code>b = 1/c − 1</code></div>
+    <div><span>stake</span><code>f = 0.25 · (q·b − (1 − q)) / b</code></div>
+  </div>
+  <p>Fees weigh most on cheap tokens, which is where a probability model most often finds "value":</p>
+  <figure>
+    <div id="chart-fee" class="chart short"></div>
+    <figcaption><strong>Figure 4.</strong> Taker fee as a share of the stake, by token price.</figcaption>
+  </figure>
+  <p>Sessions were run in May 2026 in simulation mode against the live order book. They produced 839 resolved bets across 162 distinct windows.</p>
+</section>
+
+<section id="evaluation">
+  <h2><span class="num">6</span>Testing</h2>
+  <p>The sessions reported a return of <strong>+32.6%</strong> on stake. Before trusting it I listed what the simulator did that a real account could not:</p>
+  <ol class="plain">
+    <li>It executed at the order-book <em>mid</em>, not the ask, and charged no fees.</li>
+    <li>It placed several bets inside the same window. They share one outcome and are not independent.</li>
+    <li>It included bets at token prices of 2–6¢, which cannot be filled at the quoted price.</li>
+  </ol>
+  <p>I replayed every bet, removing one bias at a time. Confidence intervals come from a cluster bootstrap that resamples <em>windows</em> rather than bets (2,000 draws).</p>
+
+  <figure>
+    <div id="chart-funnel" class="chart"></div>
+    <figcaption><strong>Figure 5.</strong> Return per dollar staked after each correction, with 95% CIs. Hatched bars: interval includes zero. The first bar uses the original Kelly stakes and has no interval.</figcaption>
+  </figure>
+
+  <table class="tbl">
+    <thead><tr><th>Step</th><th>Bets</th><th>Win rate</th><th>Return</th><th>95% CI</th></tr></thead>
+    <tbody>
+      <tr><td>As logged (Kelly stakes, mid, no fees)</td><td>839</td><td>—</td><td>+32.6%</td><td>—</td></tr>
+      <tr><td>a) Unit stake</td><td>839</td><td>34.9%</td><td>+31.7%</td><td>[−0.6, +69.0]</td></tr>
+      <tr><td>b) One bet per window</td><td>162</td><td>50.0%</td><td>+73.5%</td><td>[+27.8, +126.5]</td></tr>
+      <tr><td>c) Executable odds [0.10, 0.90]</td><td>156</td><td>49.4%</td><td>+30.8%</td><td>[+6.7, +58.0]</td></tr>
+      <tr><td>d) 1¢ half-spread (pay the ask)</td><td>156</td><td>49.4%</td><td>+26.7%</td><td>[+3.2, +51.5]</td></tr>
+      <tr><td><strong>e) Taker fee</strong></td><td>156</td><td>49.4%</td><td><strong>+22.6%</strong></td><td><strong>[−1.9, +46.7]</strong></td></tr>
+    </tbody>
+  </table>
+
+  <p>Step (b) rises because the first bet of a window is usually the earliest, when prices are most extreme; the extreme prices are then removed in (c). The source of the inflated numbers is visible when returns are split by purchase price:</p>
+
+  <figure>
+    <div id="chart-buckets" class="chart"></div>
+    <figcaption><strong>Figure 6.</strong> Return by price of the token bought (one bet per window, mid, no fees). The first bar is clipped; its return is +988% on 8 bets.</figcaption>
+  </figure>
+
+  <h3>Explore the assumptions</h3>
+  <p>The panel below replays the 156 executable bets in your browser. Change the half-spread and the fee rate; the interval is recomputed by bootstrap each time.</p>
+  <div class="widget">
+    <div class="controls">
+      <label>Half-spread <b id="v-spread">1.0¢</b><input type="range" id="s-spread" min="0" max="4" step="0.5" value="1"></label>
+      <label>Fee rate <b id="v-fee">0.070</b><input type="range" id="s-fee" min="0" max="0.10" step="0.005" value="0.07"></label>
+    </div>
+    <div class="readout">
+      <div><span>Return per $ staked</span><b id="r-roi">—</b></div>
+      <div><span>95% CI (bootstrap)</span><b id="r-ci">—</b></div>
+      <div><span>Reading</span><b id="r-verdict">—</b></div>
+    </div>
+    <div id="chart-sim" class="chart short"></div>
+    <p class="wcap">Cumulative P&amp;L in units of one-dollar stakes, windows in chronological order.</p>
+  </div>
+
+  <figure>
+    <div id="chart-heat" class="chart short"></div>
+    <figcaption><strong>Figure 7.</strong> Return by spread and fee-rate assumption. ○ marks cells whose 95% CI includes zero. Bootstrap noise is about ±1.5 points between runs.</figcaption>
+  </figure>
+</section>
+
+<section id="results">
+  <h2><span class="num">7</span>Results</h2>
+  <p>ROI blends skill with luck and with how outcomes happened to fall, so I also compared probabilities directly. The Brier score of the model's P(Up) is set against that of the market's price; a negative difference means the model is better.</p>
+
+  <figure>
+    <div id="chart-brier" class="chart"></div>
+    <figcaption><strong>Figure 8.</strong> Brier score of model and market (lower is better).</figcaption>
+  </figure>
+
+  <table class="tbl">
+    <thead><tr><th>Subset</th><th>n</th><th>Model</th><th>Market</th><th>Δ</th><th>95% CI of Δ</th></tr></thead>
+    <tbody>
+      <tr><td>All bets</td><td>162</td><td>0.2427</td><td>0.2585</td><td>−0.0158</td><td>[−0.0413, +0.0101]</td></tr>
+      <tr><td>Executable odds</td><td>156</td><td>0.2429</td><td>0.2471</td><td>−0.0042</td><td>[−0.0289, +0.0215]</td></tr>
+      <tr><td>0–60 s</td><td>111</td><td>0.2234</td><td>0.2422</td><td>−0.0187</td><td>[−0.0447, +0.0068]</td></tr>
+      <tr><td>60–120 s</td><td>32</td><td>0.2220</td><td>0.1930</td><td>+0.0289</td><td>[−0.0170, +0.0735]</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note strong">
+    <strong>Conclusion.</strong> Two things hold at once. The model is a real predictor: AUC 0.82 out of sample. But measured against the market's own price, after execution costs and with honest uncertainty, there is <em>no demonstrated edge</em>. The corrected return is positive as a point estimate, yet its interval includes zero, and the model's Brier advantage is slightly ahead early in the window, slightly behind later, and never significant. This does not reject H<sub>0</sub>: the data are consistent with an efficient market.
+  </div>
+
+  <h3>A side observation</h3>
+  <p>A separate study of the one-second bars profiled trading activity by second inside the window. It found a spike in volume in the seconds just before the window boundary, which weakens from April to September, with no accompanying signature in price amplitude or reversals. I treat this as a documented microstructure anomaly, consistent with participants positioning around resolution, and not as evidence of manipulation. It is exploratory and uses no formal test.</p>
+</section>
+
+<section id="limits">
+  <h2><span class="num">8</span>Limitations</h2>
+  <ul class="plain">
+    <li><strong>Sample size.</strong> 156 independent windows, about 13 hours of market time. Distinguishing a 5% edge from zero would take thousands.</li>
+    <li><strong>Assumed spread.</strong> Sessions logged only the mid price; the 1–2¢ half-spread is an assumption. Real spreads may be wider early in a window.</li>
+    <li><strong>Oracle mismatch.</strong> Simulated resolution uses Binance; the real market uses Chainlink.</li>
+    <li><strong>No latency or market impact.</strong> Fills are assumed instant at the observed price, on small stakes.</li>
+    <li><strong>One regime, one fold.</strong> A single model snapshot, a short simulation period and one walk-forward fold.</li>
+    <li><strong>Fee schedule.</strong> The fee model is the current published one; it may have differed when the sessions were run.</li>
+    <li><strong>The efficiency trajectory is untested.</strong> Whether the market became more efficient in the weeks after launch is plausible but not shown here. It would need historical odds from the launch and a multi-fold rolling walk-forward.</li>
+  </ul>
+</section>
+
+<section id="learned">
+  <h2><span class="num">9</span>What I learned</h2>
+  <p>This section is personal. The project taught me more about handling machine-learning models than about this market.</p>
+  <ol class="learned">
+    <li><h4>A good metric is not a result</h4><p>An AUC of 0.82 felt like success. It was not the quantity that mattered. What mattered was whether the model beat the price, and that is a much harder and quieter comparison.</p></li>
+    <li><h4>The evaluation did more work than the model</h4><p>The audit removed more apparent performance than any modelling choice had added. Realistic execution (ask, fees, fill prices) changed the answer more than any feature I engineered.</p></li>
+    <li><h4>Respect dependence in the data</h4><p>Hundreds of bets looked like hundreds of independent trials. They were 162 windows. Resampling at the level of the independent unit, not the row, widened the intervals and changed the conclusion.</p></li>
+    <li><h4>Try to break your own result first</h4><p>The strongest habit I took away is to list every way the number could be flattering before believing it, then test each one.</p></li>
+    <li><h4>Data hygiene is part of the model</h4><p>Mixed timestamp units, missing seconds and a different resolution oracle each could have silently shifted results. None of them appears in a loss curve.</p></li>
+    <li><h4>"Not demonstrated" is a finding</h4><p>Reporting that the evidence does not support an edge, with the interval to show it, is a clearer and more useful outcome than a backtest I could not defend.</p></li>
+  </ol>
+  <p class="muted">Next steps: log real bid and ask; multi-fold rolling validation; historical odds from the launch to test how efficiency evolved; and simulation of passive (maker) quoting, where fees are zero and a rebate applies.</p>
+</section>
+
+<section id="appendix">
+  <h2><span class="num">A</span>Appendix: technical stack</h2>
+  <table class="tbl small">
+    <tbody>
+      <tr><th>Data</th><td>Binance WebSocket (trades, L2 depth, liquidations) · Polymarket Gamma and CLOB (REST + WebSocket) · 1-second bars in Parquet · DuckDB · pandas · pyarrow</td></tr>
+      <tr><th>Modelling</th><td>scikit-learn HistGradientBoosting · isotonic calibration · PyTorch LSTM (Apple MPS) · logistic-regression stacking · walk-forward validation · Brier and AUC</td></tr>
+      <tr><th>Sizing</th><td>Fractional Kelly (0.25×) · time-segmented edge thresholds · stake caps · executable-odds filter · spread and fee modelling</td></tr>
+      <tr><th>Evaluation</th><td>Cluster (per-window) bootstrap · counterfactual replay · model-vs-market Brier · microstructure profiling by second</td></tr>
+      <tr><th>Engine</th><td>Python threads · HTTP and WebSocket server · browser dashboard (Chart.js) · desktop client (PyQt5, pyqtgraph) · JSON session store with generated reports</td></tr>
+      <tr><th>Operations</th><td>Dated model snapshots · scheduled retraining · Docker · Makefile</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Notes</h3>
+  <ol class="notes">
+    <li id="fn1">Launch timing from press coverage, which reports mid-February 2026 (13 February); I did not find an official Polymarket announcement to confirm the exact day. See, for example, <a href="https://coinmarketcap.com/community/post/373755232">CoinMarketCap coverage of the launch</a>. <a href="#r1">↩</a></li>
+    <li id="fn2">Polymarket documentation, <a href="https://docs.polymarket.com/trading/fees">Trading fees</a>: crypto taker fee = shares × 0.07 × p × (1 − p); makers pay no fee and receive a rebate. <a href="#r2">↩</a></li>
+  </ol>
+  <p class="muted">All figures come from simulation, not live trading, and are not investment advice.</p>
+</section>
+
+</main>
+
+<script src="assets/data.js"></script>
+<script src="assets/charts.js"></script>
+</body>
+</html>
